@@ -1,0 +1,31 @@
+# Thoughts:
+
+## Idea and the Implementation
+The idea itself is normally cool and kinda unique, but when it comes to the implementation, most subcomponents already exist.
+Especially having "specialized submodules" is an idea with such a broad design space, that whatever implementation
+you make of it, feels like it is just the same idea. The actual innovation would be to turn the ideas behind each component
+into a different implementation that does not exist, rather than using existing implementations then modifying/putting them 
+together in a way to fit the idea. What you actually define as a "component" matters a lot too.
+
+### These would be my feedback after looking at the priors:
+- Stateful modules are not new, RIMs already hold private recurrent state and update sparsely via attention 
+- Consensus buses exist in TIM (competitive attention among mechanisms) 
+- Straight through top-k gating is the same trick RIMs used for relevance masking 
+- Other stuff are industry standart components
+
+### The only thing that seems to be new in this implementation is that scaling those ideas to thousands of columns and leaving them active inside a Flash-MHA bus each step (persistent latent buffer across time). Which can be because it is dubious or computationally inefficient.
+
+# Extra:
+
+- This is just a mostly ai generated proof of concept implementation that would need to be adjusted for training and actual experimentation.
+- Out of the box it is made to work like a single pass transformer, but the intended use case is to wrap it in a multiple tick flow. Here is what o3 recommends:
+
+| What you need for BERT/GPT-style pre-training                                  | Status in current `ThousandColumns`                                                                                                                                                                                                    | Action (if any)                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **One tick per input position** (autoregressive or bidirectional)              | Already there: the outer `for t in range(T)` loop is a tick; each token is processed once and can attend to all columns.                                                                                                               | *No change required* for standard language-model or MLM training.                                                                                                                                       |
+| **Persistent memory across long contexts**                                     | Provided: `self.state` survives across the ticks within a single forward pass. You can also keep it across segments if you wish (streaming).                                                                                           | Decide in the training loop when to call `reset_state` (e.g. at document boundaries or every K tokens).                                                                                                 |
+| **Iterative refinement of the *same* token embedding** (Universal Transformer) | Not provided: each token is handled exactly once.                                                                                                                                                                                      | Wrap the module: `for _ in range(n_refine): y = tct(x); x = x + y` (or feed `x` unchanged and keep only the evolving `state`). The parameters are already shared, so this exactly matches UT behaviour. |
+| **Adaptive Computation Time (ACT)/halting**                                    | Not in code.                                                                                                                                                                                                                           | Plug ACT on top of the wrapper loop if you want token-wise variable ticks.                                                                                                                              |
+| **Causal masking for LM**                                                      | The bus attention is column-to-column, not token-to-token, so causal mask is unnecessary; you instead mask future tokens in the *input* embedding stream (standard LM practice).                                                       |                                                                                                                                                                                                         |
+| **Parallel training efficiency**                                               | Dense path still O(N²); enable `model._optimize_active = True` or implement block-sparse attention when sequence length and column count grow.                                                                                         |                                                                                                                                                                                                         |
+| **Gradient through time control**                                              | Because `self.state` is *not* detached inside the loop, back-prop spans all ticks in the batch. If you iterate internally (`n_refine>1`) or stream long sequences, use TBPTT in the training driver: `tct.state = tct.state.detach()`. |                                                                                                                                                                                                         |
